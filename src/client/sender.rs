@@ -2,18 +2,18 @@
 //! them over `sender_threads` parallel threads, each adding a random
 //! inter-packet delay and mimicking normal HTTP browser traffic.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crossbeam_channel::{bounded, Receiver};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use reqwest::blocking::Client;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -82,7 +82,9 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
 
     let total = envelopes.len();
     let acked = Arc::new(AtomicUsize::new(0));
+    let bytes_sent = Arc::new(AtomicU64::new(0));
     let file_name = chunks[0].file_name.clone();
+    let total_size: u64 = chunks.iter().map(|c| c.data.len() as u64).sum();
 
     // ── Channel → thread pool ─────────────────────────────────────────────
     let (tx, rx) = bounded::<ChunkEnvelope>(total);
@@ -90,6 +92,30 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
         tx.send(env).expect("channel send");
     }
     drop(tx); // close the channel so threads know when to stop
+
+    // ── Progress bar setup ───────────────────────────────────────────────────
+    let mp = MultiProgress::new();
+
+    let progress_style = ProgressStyle::with_template(
+        "{spinner:.green} [{bar:20.cyan/blue}] {pos}/{len} ({percent}%)",
+    )
+    .unwrap()
+    .progress_chars("=>-");
+
+    let speed_style = ProgressStyle::with_template(
+        "{spinner:.green} {msg}",
+    )
+    .unwrap();
+
+    let progress_bar = mp.add(ProgressBar::new(total as u64));
+    progress_bar.set_style(progress_style.clone());
+    progress_bar.set_message("Sending chunks...");
+
+    let speed_bar = mp.add(ProgressBar::new(total_size));
+    speed_bar.set_style(speed_style);
+    speed_bar.set_message("Speed: 0.00 MB/s");
+
+    let start_time = Instant::now();
 
     let server_url = args.server.trim_end_matches('/').to_string();
     let n_threads = args.threads;
@@ -117,8 +143,12 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
         let rx: Receiver<ChunkEnvelope> = rx.clone();
         let server_url = server_url.clone();
         let acked = Arc::clone(&acked);
+        let bytes_sent = Arc::clone(&bytes_sent);
         let chunk_hashes = Arc::clone(&chunk_hashes);
         let client = Arc::clone(&client);
+        let progress_bar = progress_bar.clone();
+        let speed_bar = speed_bar.clone();
+        let start_time = start_time;
 
         let handle = std::thread::spawn(move || {
             sender_thread(
@@ -129,16 +159,48 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
                 interval_max,
                 total,
                 acked,
+                bytes_sent,
                 chunk_hashes,
                 &client,
+                progress_bar,
+                speed_bar,
+                start_time,
             );
         });
         handles.push(handle);
     }
 
+    // Monitor speed in a separate thread
+    let speed_monitor_thread = {
+        let acked_for_monitor = Arc::clone(&acked);
+        let bytes_sent = Arc::clone(&bytes_sent);
+        let speed_bar = speed_bar.clone();
+        let start_time = start_time;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let sent = bytes_sent.load(Ordering::SeqCst);
+                    let speed_mb = sent as f64 / (1024.0 * 1024.0) / elapsed;
+                    speed_bar.set_message(format!("Speed: {:.2} MB/s", speed_mb));
+                }
+                let current_ack = acked_for_monitor.load(Ordering::SeqCst);
+                if current_ack >= total {
+                    break;
+                }
+            }
+        })
+    };
+
     for h in handles {
         let _ = h.join();
     }
+
+    let _ = speed_monitor_thread.join();
+
+    progress_bar.finish_with_message("All chunks sent!");
+    speed_bar.finish();
 
     let done = acked.load(Ordering::SeqCst);
     if done < total {
@@ -162,8 +224,12 @@ fn sender_thread(
     interval_max: Duration,
     total: usize,
     acked: Arc<AtomicUsize>,
+    bytes_sent: Arc<AtomicU64>,
     chunk_hashes: Arc<Vec<String>>,
     client: &Client,
+    progress_bar: ProgressBar,
+    _speed_bar: ProgressBar,
+    _start_time: Instant,
 ) {
 
     let mut rng = rand::thread_rng();
@@ -191,6 +257,10 @@ fn sender_thread(
                         );
                     } else {
                         let prev = acked.fetch_add(1, Ordering::SeqCst);
+                        let chunk_size = envelope.payload.len() as u64;
+                        bytes_sent.fetch_add(chunk_size, Ordering::SeqCst);
+                        progress_bar.inc(1);
+
                         info!(
                             thread = thread_id,
                             chunk = chunk_index,

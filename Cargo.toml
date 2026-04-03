@@ -53,6 +53,12 @@ crossbeam-channel = "0.5"
 # Error handling
 anyhow = "1"
 
+# Progress bar
+indicatif = "0.17"
+
+# Password input
+rpassword = "7.3"
+
 [profile.release]
 opt-level = 3
 lto = true

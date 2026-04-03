@@ -193,21 +193,24 @@ fn init_client_logging() {
 // ── Passkey resolution ────────────────────────────────────────────────────────
 
 fn resolve_passkey(supplied: Option<&str>, prompt_label: &str) -> Result<String> {
+    // 1. Use command-line supplied passkey if present
     if let Some(pk) = supplied {
         return Ok(pk.to_string());
     }
 
-    // Interactive prompt (no echo)
+    // 2. Check environment variable CFP_PASSKEY
+    if let Ok(pk) = std::env::var("CFP_PASSKEY") {
+        if !pk.is_empty() {
+            return Ok(pk);
+        }
+    }
+
+    // 3. Interactive prompt (no echo)
     print!("{}: ", prompt_label);
     io::stdout().flush()?;
 
-    // Read without echo using rpassword-like approach
-    // We use a simple stdin read here for portability
-    let mut passkey = String::new();
-    io::stdin()
-        .read_line(&mut passkey)
+    let passkey = rpassword::read_password()
         .context("Failed to read passkey")?;
-    let passkey = passkey.trim().to_string();
 
     if passkey.is_empty() {
         anyhow::bail!("Passkey cannot be empty");
