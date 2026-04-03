@@ -96,6 +96,16 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
     let interval_min = Duration::from_millis(args.interval_min_ms);
     let interval_max = Duration::from_millis(args.interval_max_ms);
 
+    // ── Shared HTTP client with connection pool limits ───────────────────────
+    let client = Arc::new(
+        Client::builder()
+            .connection_verbose(false)
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to build HTTP client"),
+    );
+
     // Track chunk hashes for verification
     let chunk_hashes: Arc<Vec<String>> = Arc::new(
         chunks.iter().map(|c| crypto::sha256_hex(&c.data)).collect(),
@@ -108,6 +118,7 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
         let server_url = server_url.clone();
         let acked = Arc::clone(&acked);
         let chunk_hashes = Arc::clone(&chunk_hashes);
+        let client = Arc::clone(&client);
 
         let handle = std::thread::spawn(move || {
             sender_thread(
@@ -119,6 +130,7 @@ pub fn run(chunks: Vec<Chunk>, args: &ClientArgs, passkey: &str) -> Result<()> {
                 total,
                 acked,
                 chunk_hashes,
+                &client,
             );
         });
         handles.push(handle);
@@ -151,11 +163,8 @@ fn sender_thread(
     total: usize,
     acked: Arc<AtomicUsize>,
     chunk_hashes: Arc<Vec<String>>,
+    client: &Client,
 ) {
-    let client = Client::builder()
-        .connection_verbose(false)
-        .build()
-        .expect("Failed to build HTTP client");
 
     let mut rng = rand::thread_rng();
 

@@ -77,7 +77,8 @@ async fn run_server(args: config::ServerArgs) -> Result<()> {
     let app = Router::new()
         .route("/complete/:session_id", get(server::handler::poll_complete))
         .fallback(server::handler::receive_chunk)
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)); // 50MB body limit
 
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
